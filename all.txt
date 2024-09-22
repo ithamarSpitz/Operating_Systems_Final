@@ -1,0 +1,868 @@
+#include "Graph.hpp"
+#include <sstream>
+#include <algorithm>
+#include <iostream>
+
+Graph::Graph() : n(0), m(0) {}
+
+void Graph::NewGraph(int n, int m) {
+    this->n = n;
+    this->m = m;
+    this->adj.assign(n, std::vector<std::pair<int, int>>());
+}
+
+void Graph::NewEdge(int i, int j, int weight) {
+    if (i > n || j > n) return;
+    adj[i - 1].push_back({j - 1, weight});
+}
+
+void Graph::RemoveEdge(int i, int j) {
+    auto& edges = adj[i - 1];
+    edges.erase(std::remove_if(edges.begin(), edges.end(),
+                               [j](const std::pair<int, int>& e) { return e.first == j - 1; }),
+                edges.end());
+}
+
+std::vector<std::string> Graph::parse(const std::string& command) {
+    std::vector<std::string> parts;
+    std::istringstream iss(command);
+    std::string part;
+    
+    while (iss >> part) {
+        parts.push_back(part);
+    }
+
+    if (parts.size() > 1 && parts[0] != "NewGraph") {
+        std::istringstream iss_args(parts[1]);
+        std::vector<std::string> args;
+        while (std::getline(iss_args, part, ',')) {
+            args.push_back(part);
+        }
+        parts.erase(parts.begin() + 1);
+        parts.insert(parts.end(), args.begin(), args.end());
+    }
+
+    return parts;
+}
+
+bool Graph::eval(const std::vector<std::string>& parts) {
+    if (parts.empty()) return true;
+
+    const std::string& cmd = parts[0];
+
+    if (cmd == "NewGraph") {
+        if (parts.size() < 3) return false;
+        int n = std::stoi(parts[1]);
+        int m = std::stoi(parts[2]);
+        if (n < 1 || m < 1) return false;
+        NewGraph(n, m);
+        return evalEdges(parts);
+    } else if (cmd == "NewEdge") {
+        if (parts.size() != 4) return false;
+        int i = std::stoi(parts[1]);
+        int j = std::stoi(parts[2]);
+        int weight = std::stoi(parts[3]);
+        if (i > n || i < 1 || j > n || j < 1) return false;
+        NewEdge(i, j, weight);
+    } else if (cmd == "RemoveEdge") {
+        if (parts.size() != 3) return false;
+        int i = std::stoi(parts[1]);
+        int j = std::stoi(parts[2]);
+        if (i > n || i < 1 || j > n || j < 1) return false;
+        RemoveEdge(i, j);
+    } else {
+        return false;
+    }
+
+    return true;
+}
+
+bool Graph::evalEdges(const std::vector<std::string>& parts) {
+    for (size_t i = 3; i < parts.size(); ++i) {
+        std::istringstream iss_edge(parts[i]);
+        std::string edge;
+        std::getline(iss_edge, edge, ',');
+        int from = std::stoi(edge);
+        std::getline(iss_edge, edge, ',');
+        int to = std::stoi(edge);
+        std::getline(iss_edge, edge, ',');
+        int weight = std::stoi(edge);
+        if (from > n || from < 1 || to > n || to < 1) return false;
+        NewEdge(from, to, weight);
+    }
+    return true;
+}#ifndef GRAPH_HPP
+#define GRAPH_HPP
+
+#include <vector>
+#include <string>
+
+class Graph {
+public:
+    Graph();
+    void NewGraph(int n, int m);
+    void NewEdge(int i, int j, int weight);
+    void RemoveEdge(int i, int j);
+    std::vector<std::string> parse(const std::string& command);
+    bool eval(const std::vector<std::string>& parts);
+
+    int getNumVertices() const { return n; }
+    const std::vector<std::vector<std::pair<int, int>>>& getAdjList() const { return adj; }
+
+private:
+    int n; // Number of vertices
+    int m; // Number of arcs
+    std::vector<std::vector<std::pair<int, int>>> adj; // Adjacency list (vertex, weight)
+    bool evalEdges(const std::vector<std::string>& parts);
+};
+
+#endif // GRAPH_HPP#ifndef LEADER_FOLLOWERS_HPP
+#define LEADER_FOLLOWERS_HPP
+
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <queue>
+#include <functional>
+#include <vector>
+#include <atomic>
+#include <iostream>
+#include <sys/socket.h>
+#include <unistd.h>
+#include <string>
+#include "MSTFactory.hpp"
+
+class LeaderFollowersThreadPool {
+public:
+    using Task = std::function<void()>;
+
+    LeaderFollowersThreadPool(size_t numThreads, int listenerSocket)
+        : stop(false), leader(std::thread::id()), listenerSocket(listenerSocket) {
+        for (size_t i = 0; i < numThreads; ++i) {
+            threads.emplace_back(&LeaderFollowersThreadPool::workerThread, this);
+        }
+    }
+
+    ~LeaderFollowersThreadPool() {
+        {
+            std::unique_lock<std::mutex> lock(queueMutex);
+            stop = true;
+        }
+        condition.notify_all();
+        for (std::thread &worker : threads) {
+            worker.join();
+        }
+    }
+
+    void enqueue(Task task) {
+        {
+            std::unique_lock<std::mutex> lock(queueMutex);
+            tasks.push(std::move(task));
+        }
+        condition.notify_one();
+    }
+
+private:
+    void workerThread() {
+        while (true) {
+            std::unique_lock<std::mutex> lock(queueMutex);
+            condition.wait(lock, [this] { return stop || !tasks.empty() || leader == std::thread::id(); });
+
+            if (stop && tasks.empty()) {
+                return;
+            }
+
+            if (leader == std::thread::id()) {
+                leader = std::this_thread::get_id();
+                lock.unlock();
+
+                // Leader thread waits for new connections
+                int newfd = acceptConnection();
+                if (newfd != -1) {
+                    enqueue([this, newfd] { handleClient(newfd); });
+                }
+
+                lock.lock();
+                if (leader == std::this_thread::get_id()) {
+                    leader = std::thread::id();
+                }
+            } else if (!tasks.empty()) {
+                Task task = std::move(tasks.front());
+                tasks.pop();
+                lock.unlock();
+
+                task();  // Execute the task
+            }
+        }
+    }
+
+    int acceptConnection() {
+        sockaddr_storage remoteaddr;
+        socklen_t addrlen = sizeof remoteaddr;
+        int newfd = accept(listenerSocket, (struct sockaddr *)&remoteaddr, &addrlen);
+        if (newfd == -1) {
+            perror("accept");
+        }
+        return newfd;
+    }
+
+    void handleClient(int fd) {
+        std::string buffer;
+        char buf[256];
+        while (true) {
+            int nbytes = recv(fd, buf, sizeof buf, 0);
+            if (nbytes <= 0) {
+                if (nbytes == 0) {
+                    std::cout << "Socket " << fd << " hung up\n";
+                } else {
+                    perror("recv");
+                }
+                close(fd);
+                return;
+            }
+            buffer.append(buf, nbytes);
+            size_t pos;
+            while ((pos = buffer.find('\n')) != std::string::npos) {
+                std::string command = buffer.substr(0, pos);
+                buffer.erase(0, pos + 1);
+                std::cout << "Client " << fd << " - Received command: " << command << std::endl;
+                std::vector<std::string> data = g.parse(command);
+                std::lock_guard<std::mutex> lock(graph_mutex);
+                std::string result = g.eval(data);
+                // Send response to client
+                std::string response = result != "-1" ? "Command processed successfully\n" + result : "Command processing failed\n";
+                send(fd, response.c_str(), response.length(), 0);
+                
+                std::cout << "Client " << fd << " - Sent response: " << response;
+                if (result == "-1") std::cerr << "exit" << std::endl;
+            }
+        }
+    }
+
+    std::vector<std::thread> threads;
+    std::queue<Task> tasks;
+    std::mutex queueMutex;
+    std::condition_variable condition;
+    std::atomic<bool> stop;
+    std::atomic<std::thread::id> leader;
+    int listenerSocket;
+
+    // Added members for graph operations
+    Graph g;
+    std::mutex graph_mutex;
+};
+
+#endif // LEADER_FOLLOWERS_HPP#include "Server.hpp"
+#include <iostream>
+
+// int main(int argc, char* argv[]) {
+//     try {
+//         size_t numThreads = std::thread::hardware_concurrency();
+//         if (argc > 1) {
+//             numThreads = std::stoul(argv[1]);
+//         }
+
+//         Server server(numThreads);
+//         server.run();
+//     } catch (const std::exception& e) {
+//         std::cerr << "Error: " << e.what() << std::endl;
+//         return 1;
+//     }
+
+//     return 0;
+// }
+
+int main() {
+    Server server;
+    server.run();
+    return 0;
+}main.o: main.cpp Server.hpp leader_followers.hpp MSTFactory.hpp \
+ MSTAlgorithm.hpp Graph.hpp MST.hpp
+
+Server.hpp:
+
+leader_followers.hpp:
+
+MSTFactory.hpp:
+
+MSTAlgorithm.hpp:
+
+Graph.hpp:
+
+MST.hpp:
+CXX = g++
+CXXFLAGS = -std=c++17 -Wall -Wextra -pedantic -pthread
+LDFLAGS = -pthread
+
+SRCS = main.cpp Graph.cpp MSTAlgorithm.cpp MST.cpp MSTFactory.cpp
+OBJS = $(SRCS:.cpp=.o)
+DEPS = $(SRCS:.cpp=.d)
+
+TARGET = mst_server
+
+.PHONY: all clean
+
+all: $(TARGET)
+
+$(TARGET): $(OBJS)
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
+
+%.o: %.cpp
+	$(CXX) $(CXXFLAGS) -MMD -MP -c $< -o $@
+
+-include $(DEPS)
+
+clean:
+	rm -f $(OBJS) $(DEPS) $(TARGET)#include "MSTAlgorithm.hpp"
+#include <algorithm>
+#include <queue>
+#include <limits>
+
+// Boruvka's Algorithm
+MST BoruvkaAlgorithm::solve(const Graph& graph) {
+    int n = graph.getNumVertices();
+    MST mst(n);
+    std::vector<int> components(n);
+    for (int i = 0; i < n; ++i) components[i] = i;
+
+    auto find = [&](int x) {
+        while (x != components[x]) {
+            components[x] = components[components[x]];
+            x = components[x];
+        }
+        return x;
+    };
+
+    auto merge = [&](int x, int y) {
+        x = find(x);
+        y = find(y);
+        if (x != y) components[x] = y;
+    };
+
+    bool changed;
+    do {
+        changed = false;
+        std::vector<std::pair<int, std::pair<int, int>>> cheapest(n, {std::numeric_limits<int>::max(), {-1, -1}});
+
+        for (int i = 0; i < n; ++i) {
+            for (const auto& edge : graph.getAdjList()[i]) {
+                int j = edge.first;
+                int weight = edge.second;
+                int ci = find(i);
+                int cj = find(j);
+                if (ci != cj) {
+                    if (weight < cheapest[ci].first) cheapest[ci] = {weight, {i, j}};
+                    if (weight < cheapest[cj].first) cheapest[cj] = {weight, {i, j}};
+                }
+            }
+        }
+
+        for (int i = 0; i < n; ++i) {
+            if (cheapest[i].second.first != -1) {
+                int u = cheapest[i].second.first;
+                int v = cheapest[i].second.second;
+                if (find(u) != find(v)) {
+                    mst.addEdge(u, v, cheapest[i].first);
+                    merge(u, v);
+                    changed = true;
+                }
+            }
+        }
+    } while (changed);
+
+    return mst;
+}
+
+// Prim's Algorithm
+MST PrimAlgorithm::solve(const Graph& graph) {
+    int n = graph.getNumVertices();
+    MST mst(n);
+    std::vector<bool> visited(n, false);
+    std::priority_queue<std::pair<int, std::pair<int, int>>, 
+                        std::vector<std::pair<int, std::pair<int, int>>>, 
+                        std::greater<std::pair<int, std::pair<int, int>>>> pq;
+
+    pq.push({0, {0, -1}});
+
+    while (!pq.empty()) {
+        int u = pq.top().second.first;
+        int parent = pq.top().second.second;
+        int weight = pq.top().first;
+        pq.pop();
+
+        if (visited[u]) continue;
+        visited[u] = true;
+
+        if (parent != -1) {
+            mst.addEdge(parent, u, weight);
+        }
+
+        for (const auto& edge : graph.getAdjList()[u]) {
+            int v = edge.first;
+            int w = edge.second;
+            if (!visited[v]) {
+                pq.push({w, {v, u}});
+            }
+        }
+    }
+
+    return mst;
+}
+
+// Kruskal's Algorithm
+MST KruskalAlgorithm::solve(const Graph& graph) {
+    int n = graph.getNumVertices();
+    MST mst(n);
+    std::vector<std::pair<int, std::pair<int, int>>> edges;
+    
+    for (int i = 0; i < n; ++i) {
+        for (const auto& edge : graph.getAdjList()[i]) {
+            int j = edge.first;
+            int weight = edge.second;
+            if (i < j) {  // Avoid duplicates
+                edges.push_back({weight, {i, j}});
+            }
+        }
+    }
+    
+    std::sort(edges.begin(), edges.end());
+    
+    std::vector<int> parent(n);
+    for (int i = 0; i < n; ++i) parent[i] = i;
+    
+    struct FindUnion {
+        std::vector<int>& parent;
+        
+        FindUnion(std::vector<int>& p) : parent(p) {}
+        
+        int find(int x) {
+            if (parent[x] != x) parent[x] = find(parent[x]);
+            return parent[x];
+        }
+        
+        void unite(int x, int y) {
+            x = find(x);
+            y = find(y);
+            if (x != y) parent[x] = y;
+        }
+    };
+    
+    FindUnion fu(parent);
+    
+    for (const auto& edge : edges) {
+        int weight = edge.first;
+        int u = edge.second.first;
+        int v = edge.second.second;
+        
+        if (fu.find(u) != fu.find(v)) {
+            fu.unite(u, v);
+            mst.addEdge(u, v, weight);
+        }
+    }
+    
+    return mst;
+}
+
+// Tarjan's Algorithm
+// Note: This is a simplified version that doesn't implement the full Tarjan's algorithm
+// It uses a combination of Kruskal's and Union-Find data structure
+MST TarjanAlgorithm::solve(const Graph& graph) {
+    int n = graph.getNumVertices();
+    MST mst(n);
+    std::vector<std::pair<int, std::pair<int, int>>> edges;
+    
+    for (int i = 0; i < n; ++i) {
+        for (const auto& edge : graph.getAdjList()[i]) {
+            int j = edge.first;
+            int weight = edge.second;
+            if (i < j) {  // Avoid duplicates
+                edges.push_back({weight, {i, j}});
+            }
+        }
+    }
+    
+    std::sort(edges.begin(), edges.end());
+    
+    class UnionFind {
+    private:
+        std::vector<int> parent, rank;
+    
+    public:
+        UnionFind(int n) : parent(n), rank(n, 0) {
+            for (int i = 0; i < n; ++i) parent[i] = i;
+        }
+        
+        int find(int x) {
+            if (parent[x] != x) parent[x] = find(parent[x]);
+            return parent[x];
+        }
+        
+        bool unite(int x, int y) {
+            x = find(x);
+            y = find(y);
+            if (x == y) return false;
+            if (rank[x] < rank[y]) std::swap(x, y);
+            parent[y] = x;
+            if (rank[x] == rank[y]) ++rank[x];
+            return true;
+        }
+    };
+    
+    UnionFind uf(n);
+    
+    for (const auto& edge : edges) {
+        int weight = edge.first;
+        int u = edge.second.first;
+        int v = edge.second.second;
+        
+        if (uf.unite(u, v)) {
+            mst.addEdge(u, v, weight);
+        }
+    }
+    
+    return mst;
+}
+
+// Integer MST Algorithm
+// Note: This is a simplified version that assumes all weights are integers
+// It uses counting sort to achieve linear time complexity
+MST IntegerMSTAlgorithm::solve(const Graph& graph) {
+    int n = graph.getNumVertices();
+    MST mst(n);
+    
+    // Find the maximum weight
+    int max_weight = 0;
+    for (int i = 0; i < n; ++i) {
+        for (const auto& edge : graph.getAdjList()[i]) {
+            max_weight = std::max(max_weight, edge.second);
+        }
+    }
+    
+    // Counting sort
+    std::vector<std::vector<std::pair<int, int>>> count(max_weight + 1);
+    for (int i = 0; i < n; ++i) {
+        for (const auto& edge : graph.getAdjList()[i]) {
+            int j = edge.first;
+            int weight = edge.second;
+            if (i < j) {  // Avoid duplicates
+                count[weight].push_back({i, j});
+            }
+        }
+    }
+    
+    class UnionFind {
+    private:
+        std::vector<int> parent, rank;
+    
+    public:
+        UnionFind(int n) : parent(n), rank(n, 0) {
+            for (int i = 0; i < n; ++i) parent[i] = i;
+        }
+        
+        int find(int x) {
+            if (parent[x] != x) parent[x] = find(parent[x]);
+            return parent[x];
+        }
+        
+        bool unite(int x, int y) {
+            x = find(x);
+            y = find(y);
+            if (x == y) return false;
+            if (rank[x] < rank[y]) std::swap(x, y);
+            parent[y] = x;
+            if (rank[x] == rank[y]) ++rank[x];
+            return true;
+        }
+    };
+    
+    UnionFind uf(n);
+    
+    for (int weight = 0; weight <= max_weight; ++weight) {
+        for (const auto& edge : count[weight]) {
+            int u = edge.first;
+            int v = edge.second;
+            
+            if (uf.unite(u, v)) {
+                mst.addEdge(u, v, weight);
+            }
+        }
+    }
+    
+    return mst;
+}#ifndef MST_ALGORITHM_HPP
+#define MST_ALGORITHM_HPP
+
+#include "Graph.hpp"
+#include "MST.hpp"
+
+class MSTAlgorithm {
+public:
+    virtual MST solve(const Graph& graph) = 0;
+    virtual ~MSTAlgorithm() = default;
+};
+
+class BoruvkaAlgorithm : public MSTAlgorithm {
+public:
+    MST solve(const Graph& graph) override;
+};
+
+class PrimAlgorithm : public MSTAlgorithm {
+public:
+    MST solve(const Graph& graph) override;
+};
+
+class KruskalAlgorithm : public MSTAlgorithm {
+public:
+    MST solve(const Graph& graph) override;
+};
+
+class TarjanAlgorithm : public MSTAlgorithm {
+public:
+    MST solve(const Graph& graph) override;
+};
+
+class IntegerMSTAlgorithm : public MSTAlgorithm {
+public:
+    MST solve(const Graph& graph) override;
+};
+
+#endif // MST_ALGORITHM_HPP#include "MST.hpp"
+#include <algorithm>
+#include <limits>
+#include <queue>
+
+MST::MST(int n) : n(n), edges(n), distances(n, std::vector<int>(n, std::numeric_limits<int>::max())) {
+    for (int i = 0; i < n; ++i) {
+        distances[i][i] = 0;
+    }
+}
+
+void MST::addEdge(int from, int to, int weight) {
+    edges[from].push_back({to, weight});
+    edges[to].push_back({from, weight});
+}
+
+int MST::getTotalWeight() const {
+    int total = 0;
+    for (int i = 0; i < n; ++i) {
+        for (const auto& edge : edges[i]) {
+            total += edge.second;
+        }
+    }
+    return total / 2; // Each edge is counted twice
+}
+
+void MST::calculateDistances() {
+    for (int start = 0; start < n; ++start) {
+        std::priority_queue<std::pair<int, int>, std::vector<std::pair<int, int>>, std::greater<std::pair<int, int>>> pq;
+        pq.push({0, start});
+        
+        while (!pq.empty()) {
+            int dist = pq.top().first;
+            int v = pq.top().second;
+            pq.pop();
+            
+            if (dist > distances[start][v]) continue;
+            
+            for (const auto& edge : edges[v]) {
+                int to = edge.first;
+                int weight = edge.second;
+                if (distances[start][v] + weight < distances[start][to]) {
+                    distances[start][to] = distances[start][v] + weight;
+                    pq.push({distances[start][to], to});
+                }
+            }
+        }
+    }
+}
+
+int MST::getLongestDistance() const {
+    int maxDist = 0;
+    for (int i = 0; i < n; ++i) {
+        for (int j = 0; j < n; ++j) {
+            if (distances[i][j] != std::numeric_limits<int>::max()) {
+                maxDist = std::max(maxDist, distances[i][j]);
+            }
+        }
+    }
+    return maxDist;
+}
+
+double MST::getAverageDistance() const {
+    long long sum = 0;
+    int count = 0;
+    for (int i = 0; i < n; ++i) {
+        for (int j = i; j < n; ++j) {
+            if (distances[i][j] != std::numeric_limits<int>::max()) {
+                sum += distances[i][j];
+                count++;
+            }
+        }
+    }
+    return static_cast<double>(sum) / count;
+}
+
+int MST::getShortestDistance() const {
+    int minDist = std::numeric_limits<int>::max();
+    for (int i = 0; i < n; ++i) {
+        for (const auto& edge : edges[i]) {
+            minDist = std::min(minDist, edge.second);
+        }
+    }
+    return minDist;
+}#include "MSTFactory.hpp"
+#include "MSTAlgorithm.hpp"
+#include <stdexcept>
+#include <memory>
+
+std::unique_ptr<MSTAlgorithm> MSTFactory::createAlgorithm(const std::string& algorithmName) {
+    if (algorithmName == "Boruvka") {
+        return std::make_unique<BoruvkaAlgorithm>();
+    } else if (algorithmName == "Prim") {
+        return std::make_unique<PrimAlgorithm>();
+    } else if (algorithmName == "Kruskal") {
+        return std::make_unique<KruskalAlgorithm>();
+    } else if (algorithmName == "Tarjan") {
+        return std::make_unique<TarjanAlgorithm>();
+    } else if (algorithmName == "Integer") {
+        return std::make_unique<IntegerMSTAlgorithm>();
+    } else {
+        throw std::invalid_argument("Unknown algorithm: " + algorithmName);
+    }
+}#ifndef MST_FACTORY_HPP
+#define MST_FACTORY_HPP
+
+#include "MSTAlgorithm.hpp"
+#include <memory>
+#include <string>
+
+class MSTFactory {
+public:
+    static std::unique_ptr<MSTAlgorithm> createAlgorithm(const std::string& name);
+};
+
+#endif // MST_FACTORY_HPP#ifndef MST_HPP
+#define MST_HPP
+
+#include <vector>
+
+class MST {
+public:
+    MST(int n);
+    void addEdge(int from, int to, int weight);
+    int getTotalWeight() const;
+    int getLongestDistance() const;
+    double getAverageDistance() const;
+    int getShortestDistance() const;
+
+private:
+    int n;
+    std::vector<std::vector<std::pair<int, int>>> edges; // (to, weight)
+    std::vector<std::vector<int>> distances;
+    void calculateDistances();
+};
+
+#endif // MST_HPP#ifndef SERVER_HPP
+#define SERVER_HPP
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <iostream>
+#include <string>
+#include <memory>
+#include <mutex>
+#include "leader_followers.hpp"
+
+class Server {
+public:
+    Server(size_t numThreads = std::thread::hardware_concurrency())
+        : numThreads(numThreads) {}
+
+    void run() {
+        int listener = setup_listener();
+        if (listener == -1) {
+            std::cerr << "Failed to setup listener\n";
+            return;
+        }
+
+        LeaderFollowersThreadPool threadPool(numThreads, listener);
+
+        std::cout << "Server running on port " << PORT << std::endl;
+
+        while (true) {
+            if (std::cin.rdbuf()->in_avail() > 0) {
+                char input;
+                std::cin >> input;
+                if (input == 'q') {
+                    break;
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+
+        close(listener);
+    }
+
+private:
+    static constexpr const char* PORT = "9034";
+    size_t numThreads;
+
+    static void* get_in_addr(struct sockaddr *sa) {
+        if (sa->sa_family == AF_INET) {
+            return &(((struct sockaddr_in*)sa)->sin_addr);
+        }
+        return &(((struct sockaddr_in6*)sa)->sin6_addr);
+    }
+
+    int setup_listener() {
+        struct addrinfo hints{}, *ai, *p;
+        int listener;
+        int yes = 1;
+        int rv;
+
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_flags = AI_PASSIVE;
+        if ((rv = getaddrinfo(nullptr, PORT, &hints, &ai)) != 0) {
+            std::cerr << "getaddrinfo: " << gai_strerror(rv) << '\n';
+            return -1;
+        }
+    
+        for(p = ai; p != nullptr; p = p->ai_next) {
+            listener = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+            if (listener < 0) continue;
+        
+            setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(int));
+
+            if (bind(listener, p->ai_addr, p->ai_addrlen) < 0) {
+                close(listener);
+                continue;
+            }
+
+            break;
+        }
+
+        freeaddrinfo(ai);
+
+        if (p == nullptr) {
+            std::cerr << "Failed to bind\n";
+            return -1;
+        }
+
+        if (listen(listener, 10) == -1) {
+            perror("listen");
+            return -1;
+        }
+
+        return listener;
+    }
+};
+
+#endif // SERVER_HPP
