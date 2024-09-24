@@ -12,6 +12,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <string>
+#include <sstream>
 #include "MSTFactory.hpp"
 
 class LeaderFollowersThreadPool {
@@ -58,7 +59,6 @@ private:
                 leader = std::this_thread::get_id();
                 lock.unlock();
 
-                // Leader thread waits for new connections
                 int newfd = acceptConnection();
                 if (newfd != -1) {
                     enqueue([this, newfd] { handleClient(newfd); });
@@ -73,7 +73,7 @@ private:
                 tasks.pop();
                 lock.unlock();
 
-                task();  // Execute the task
+                task();
             }
         }
     }
@@ -110,13 +110,34 @@ private:
                 std::cout << "Client " << fd << " - Received command: " << command << std::endl;
                 std::vector<std::string> data = g.parse(command);
                 std::lock_guard<std::mutex> lock(graph_mutex);
-                bool result = g.eval(data);
-                // Send response to client
-                std::string response = result ? "Command processed successfully\n" + result : "Command processing failed\n";
-                send(fd, response.c_str(), response.length(), 0);
+                std::string result;
+                bool success = g.eval(data);
+                if (success) {
+                    result = "Command processed successfully\n";
+                    if (data[0] == "RunMST") {
+                        const std::string& algorithm = data[1];
+                        try {
+                            auto mstAlgorithm = MSTFactory::createAlgorithm(algorithm);
+                            MST mst = mstAlgorithm->solve(g);
+                            mst.calculateDistances();
+                            std::ostringstream oss;
+                            oss << "MST total weight: " << mst.getTotalWeight() << "\n";
+                            oss << "Longest distance: " << mst.getLongestDistance() << "\n";
+                            oss << "Average distance: " << mst.getAverageDistance() << "\n";
+                            oss << "Shortest distance: " << mst.getShortestDistance() << "\n";
+                            result += oss.str();
+                        } catch (const std::exception& e) {
+                            result = "Error running MST algorithm: " + std::string(e.what()) + "\n";
+                            success = false;
+                        }
+                    }
+                } else {
+                    result = "Command processing failed\n";
+                }
+                send(fd, result.c_str(), result.length(), 0);
                 
-                std::cout << "Client " << fd << " - Sent response: " << response;
-                if (!result) std::cerr << "exit" << std::endl;
+                std::cout << "Client " << fd << " - Sent response: " << result;
+                if (!success) std::cerr << "exit" << std::endl;
             }
         }
     }
@@ -129,7 +150,6 @@ private:
     std::atomic<std::thread::id> leader;
     int listenerSocket;
 
-    // Added members for graph operations
     Graph g;
     std::mutex graph_mutex;
 };

@@ -12,6 +12,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <string>
+#include <sstream>
 #include "Graph.hpp"
 #include "MSTFactory.hpp"
 
@@ -75,8 +76,7 @@ public:
           responder(std::make_unique<ActiveObject>()) {}
 
     ~Pipeline() {
-        stop = true;
-        // Optionally, add code here to ensure all ActiveObjects have finished their tasks
+        stopPipeline();
     }
 
     void start() {
@@ -85,8 +85,8 @@ public:
 
     void stopPipeline() {
         stop = true;
-        // Add code to wake up the acceptor thread if it's blocked on accept()
-        // For example, you could use a self-pipe trick or close the listener socket
+        shutdown(listenerSocket, SHUT_RDWR);
+        close(listenerSocket);
     }
 
 private:
@@ -96,7 +96,7 @@ private:
             socklen_t addrlen = sizeof remoteaddr;
             int clientfd = accept(listenerSocket, (struct sockaddr *)&remoteaddr, &addrlen);
             if (clientfd == -1) {
-                if (errno != EINTR) {  // EINTR could be caused by signal interruption during shutdown
+                if (errno != EINTR && !stop) {
                     perror("accept");
                 }
                 continue;
@@ -129,16 +129,39 @@ private:
     }
 
     void executeCommand(int clientfd, const std::vector<std::string>& command) {
-        bool result;
+        std::string result;
         {
             std::lock_guard<std::mutex> lock(graph_mutex);
-            result = graph.eval(command);
+            if (command[0] == "RunMST") {
+                result = runMST(command[1]);
+            } else {
+                result = graph.eval(command) ? "Command processed successfully" : "Command processing failed";
+            }
         }
         responder->enqueue([this, clientfd, result] { sendResponse(clientfd, result); });
     }
 
-    void sendResponse(int clientfd, bool result) {
-        std::string response = result ? "Command processed successfully\n" : "Command processing failed\n";
+    std::string runMST(const std::string& algorithm) {
+        try {
+            auto mstAlgorithm = MSTFactory::createAlgorithm(algorithm);
+            MST mst = mstAlgorithm->solve(graph);
+            mst.calculateDistances();
+
+            std::stringstream ss;
+            ss << "MST Results:\n"
+               << "Total weight: " << mst.getTotalWeight() << "\n"
+               << "Longest distance: " << mst.getLongestDistance() << "\n"
+               << "Average distance: " << mst.getAverageDistance() << "\n"
+               << "Shortest distance: " << mst.getShortestDistance() << "\n";
+            
+            return ss.str();
+        } catch (const std::exception& e) {
+            return std::string("Error running MST algorithm: ") + e.what();
+        }
+    }
+
+    void sendResponse(int clientfd, const std::string& result) {
+        std::string response = result + "\n";
         send(clientfd, response.c_str(), response.length(), 0);
         std::cout << "Client " << clientfd << " - Sent response: " << response;
     }

@@ -2,7 +2,7 @@ CXX = g++
 CXXFLAGS = -std=c++17 -Wall -Wextra -pedantic -pthread
 LDFLAGS = -pthread
 
-SRCS = main.cpp Graph.cpp MSTAlgorithm.cpp MST.cpp MSTFactory.cpp
+SRCS = main.cpp Graph.cpp MSTAlgorithm.cpp
 OBJS = $(SRCS:.cpp=.o)
 DEPS = $(SRCS:.cpp=.d)
 

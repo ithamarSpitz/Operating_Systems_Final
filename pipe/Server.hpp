@@ -1,28 +1,25 @@
+#ifndef SERVER_HPP
+#define SERVER_HPP
+
 #include "pipeline_active_object.hpp"
-#include <cstdio>
-#include <cstdlib>
+#include <atomic>
+#include <iostream>
+#include <memory>
+#include <thread>
+#include <chrono>
 #include <cstring>
-#include <unistd.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
-#include <iostream>
-#include <string>
-#include <memory>
-#include <mutex>
-#include <csignal>
-#include <thread>
-#include <chrono>
+#include <unistd.h>
 
 class Server {
 public:
-    Server() : pipeline(nullptr), listener(-1) {}
+    Server() : pipeline(nullptr), listener(-1), running(false) {}
     ~Server() {
-        if (listener != -1) {
-            close(listener);
-        }
+        stop();
     }
 
     void run() {
@@ -36,35 +33,14 @@ public:
         pipeline->start();
         std::cout << "Server running on port " << PORT << std::endl;
 
-        // Set up signal handling
-        struct sigaction sa;
-        sa.sa_handler = Server::signal_handler;
-        sigemptyset(&sa.sa_mask);
-        sa.sa_flags = 0;
-        sigaction(SIGINT, &sa, nullptr);
-        sigaction(SIGTERM, &sa, nullptr);
-
-        // Wait for stop signal
-        while (!stop) {
-            std::this_thread::sleep_for(std::chrono::seconds(1));
+        running = true;
+        while (running) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
-
-        std::cout << "Shutting down server..." << std::endl;
-        shutdown();
     }
 
-private:
-    static constexpr const char* PORT = "9034";
-    static std::atomic<bool> stop;
-    std::unique_ptr<Pipeline> pipeline;
-    int listener;
-
-    static void signal_handler(int signal) {
-        std::cout << "Received signal " << signal << std::endl;
-        stop = true;
-    }
-
-    void shutdown() {
+    void stop() {
+        running = false;
         if (pipeline) {
             pipeline->stopPipeline();
             pipeline.reset();
@@ -73,6 +49,18 @@ private:
             close(listener);
             listener = -1;
         }
+    }
+
+private:
+    static constexpr const char* PORT = "9034";
+    std::unique_ptr<Pipeline> pipeline;
+    int listener;
+    std::atomic<bool> running;
+
+    static void signal_handler(int signal) {
+        std::cout << "Received signal " << signal << std::endl;
+        // Use a static instance to call the non-static member function
+        static_cast<Server*>(nullptr)->stop();
     }
 
     static void* get_in_addr(struct sockaddr *sa) {
@@ -88,6 +76,7 @@ private:
         int yes = 1;
         int rv;
 
+        std::memset(&hints, 0, sizeof hints);
         hints.ai_family = AF_UNSPEC;
         hints.ai_socktype = SOCK_STREAM;
         hints.ai_flags = AI_PASSIVE;
@@ -124,3 +113,5 @@ private:
         return listener;
     }
 };
+
+#endif // SERVER_HPP
